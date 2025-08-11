@@ -9,17 +9,17 @@ license = "LGPL-3.0"
 [workspace]
 members = [
     ".",
-    "crates/data-logging",
-    "crates/kalman-filter", 
-    "crates/plugin-loader",
-    "crates/robot-control-interface",
-    "crates/signal-io-interface",
-    "crates/signal-processing",
-    "crates/multithreading",
-    "crates/precise-timing",
-    "crates/system-linearizer",
-    "crates/data-io",
-    "crates/ipc-interface",
+#    "crates/data-logging",
+#    "crates/kalman-filter", 
+#    "crates/plugin-loader",
+#    "crates/robot-control-interface",
+#    "crates/signal-io-interface",
+#    "crates/signal-processing",
+#    "crates/multithreading",
+#    "crates/precise-timing",
+#    "crates/system-linearizer",
+#    "crates/data-io",
+#    "crates/ipc-interface",
 ]
 
 [dependencies]
@@ -36,11 +36,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Math and linear algebra
 nalgebra = "0.32"
 ndarray = "0.15"
-blas-src = { version = "0.10", features = ["openblas"] }
-lapack-src = { version = "0.8", features = ["openblas"] }
-
-# IPC and networking
-zmq = "0.10"
 shared_memory = "0.12"
 mio = "0.8"
 
@@ -48,27 +43,30 @@ mio = "0.8"
 libloading = "0.8"
 abi_stable = "0.11"
 
-# Expression evaluation
-evalexpr = "11.0"
-
 # Timing and real-time
 spin_sleep = "1.1"
 
 # Configuration
 config = "0.14"
+kfilter = "0.4.0"
+mlsnd = "0.1.1"
+ros2-client = "0.8.1"
+simplelog = "0.12.2"
+evalexpr = "12.0.2"
+iir_filters = "0.1.3"
 
 # Workspace crates
-data-logging = { path = "crates/data-logging" }
-kalman-filter = { path = "crates/kalman-filter" }
-plugin-loader = { path = "crates/plugin-loader" }
-robot-control-interface = { path = "crates/robot-control-interface" }
-signal-io-interface = { path = "crates/signal-io-interface" }
-signal-processing = { path = "crates/signal-processing" }
-multithreading = { path = "crates/multithreading" }
-precise-timing = { path = "crates/precise-timing" }
-system-linearizer = { path = "crates/system-linearizer" }
-data-io = { path = "crates/data-io" }
-ipc-interface = { path = "crates/ipc-interface" }
+#data-logging = { path = "crates/data-logging" }
+#kalman-filter = { path = "crates/kalman-filter" }
+#plugin-loader = { path = "crates/plugin-loader" }
+#robot-control-interface = { path = "crates/robot-control-interface" }
+#signal-io-interface = { path = "crates/signal-io-interface" }
+#signal-processing = { path = "crates/signal-processing" }
+#multithreading = { path = "crates/multithreading" }
+#precise-timing = { path = "crates/precise-timing" }
+#system-linearizer = { path = "crates/system-linearizer" }
+#data-io = { path = "crates/data-io" }
+#ipc-interface = { path = "crates/ipc-interface" }
 
 [dev-dependencies]
 criterion = "0.5"
