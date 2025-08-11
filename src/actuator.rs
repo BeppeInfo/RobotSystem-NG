@@ -1,420 +1,245 @@
+////////////////////////////////////////////////////////////////////////////////
+//                                                                            //
+//  Copyright (c) 2025 Leonardo Consoni                                       //
+//                                                                            //
+//  This file is part of RobotSystem-NG.                                      //
+//                                                                            //
+//  RobotSystem-NG is free software: you can redistribute it and/or modify    //
+//  it under the terms of the GNU Lesser General Public License as published  //
+//  by the Free Software Foundation, either version 3 of the License, or      //
+//  (at your option) any later version.                                       //
+//                                                                            //
+//  RobotSystem-NG is distributed in the hope that it will be useful,         //
+//  but WITHOUT ANY WARRANTY; without even the implied warranty of            //
+//  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the              //
+//  GNU Lesser General Public License for more details.                       //
+//                                                                            //
+//  You should have received a copy of the GNU Lesser General Public License  //
+//  along with RobotSystem-NG. If not, see <http://www.gnu.org/licenses/>.    //
+//                                                                            //
+////////////////////////////////////////////////////////////////////////////////
+
 use std::collections::HashMap;
+
+use serde::{Deserialize, Serialize};
+use serde_json;
+
 use std::path::Path;
-use std::sync::Arc;
+// use std::sync::Arc;
+use std::fs::File;
+// use std::io::prelude::*;
 
-use anyhow::{Context, Result};
-use tokio::sync::{Mutex, RwLock};
-use tracing::{debug, info, warn};
+// use anyhow::{Context, Result};
+// use tokio::sync::{Mutex, RwLock};
+// use tracing::{debug, info, warn};
 
-use crate::config::ActuatorConfig;
-use crate::sensor::{Sensor, SensorId};
-use crate::motor::{Motor, MotorId};
-use crate::shared_types::{ActuatorState, AxisState, JointState, ControlOutput, ControlVariables};
-use kalman_filter::KalmanFilter;
-use plugin_loader::PluginLoader;
-use data_logging::DataLogger;
+use crate::sensor::Sensor;
+use crate::motor::Motor;
 
-pub type ActuatorId = String;
+use crate::control_types::{ControlState, ControlVariables};
+
+use kfilter::{Kalman1M, KalmanFilter, KalmanPredictInput};
+use nalgebra::{DMatrix, SMatrix};
+
+enum ControlIndex {POSITION=0, VELOCITY=1, ACCELERATION=2, FORCE=3}
+
+const CONTROL_VARIABLE_NAMES:HashMap<&str,ControlIndex> = HashMap::from(
+    [("POSITION",ControlIndex::POSITION), ("VELOCITY",ControlIndex::VELOCITY), ("ACCELERATION",ControlIndex::ACCELERATION), ("FORCE",ControlIndex::FORCE)]
+);
+
+fn default_limit() -> f64 {
+    return -1.0;
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct ActuatorIOConfig {
+    variable: String,
+    config: String,
+    #[serde(default)]
+    deviation: f64,
+    #[serde(default="default_limit")]
+    limit: f64
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct ActuatorConfig {
+    sensors: Vec<ActuatorIOConfig>,
+    motor: ActuatorIOConfig
+}
 
 #[derive(Debug)]
 pub struct Actuator {
-    pub id: ActuatorId,
-    pub config: ActuatorConfig,
-    pub sensors: HashMap<SensorId, Arc<Sensor>>,
-    pub motors: HashMap<MotorId, Arc<Motor>>,
-    pub kalman_filter: Arc<Mutex<KalmanFilter>>,
-    pub state: Arc<RwLock<ActuatorState>>,
-    pub data_logger: Arc<DataLogger>,
-    axes_count: usize,
-    joints_count: usize,
+    control_state: ControlState,
+    control_mode: ControlIndex,
+    sensors: Vec<Sensor>,
+    motor: Motor,
+    motion_filter: KalmanFilter,
+    setpoint_limit: f64
 }
 
 impl Actuator {
-    pub async fn load(
-        root_dir: &Path,
-        actuator_id: &str,
-        log_dir: &Path,
-        plugin_loader: &mut PluginLoader,
-    ) -> Result<Self> {
-        info!("Loading actuator: {}", actuator_id);
+    pub fn load(root_dir: &Path, config_name: &str, log_dir: &Path) -> Result<Self> {
+        // info!("Loading actuator: {}", config_name);
 
-        // Load actuator configuration
-        let config_path = root_dir.join("config/actuators").join(format!("{}.json", actuator_id));
-        let config = ActuatorConfig::load(&config_path)
-            .context("Failed to load actuator configuration")?;
+        // Load motor configuration
+        let config_path = root_dir.join("config/actuators").join(format!("{}.json", config_name));
+        let config_file = File::open(config_path)?;
+        let config:ActuatorConfig = serde_json::from_reader(config_file)?;
 
-        info!("Actuator config loaded: {} sensors, {} motors", 
-              config.sensor_ids.len(), config.motor_ids.len());
+        // info!("Actuator config loaded: {} sensors, {} motor", config.sensors.len(), config.motor.config);
 
-        // Initialize data logger
-        let actuator_log_dir = log_dir.join(actuator_id);
-        tokio::fs::create_dir_all(&actuator_log_dir).await?;
-        let data_logger = Arc::new(DataLogger::new(&actuator_log_dir)?);
+        const STATES_NUMBER:usize = CONTROL_VARIABLE_NAMES.len();
+        let measures_number:usize = config.sensors.len();
 
-        // Load sensors
-        let mut sensors = HashMap::new();
-        for sensor_id in &config.sensor_ids {
-            debug!("Loading sensor: {}", sensor_id);
-            let sensor = Arc::new(
-                Sensor::load(root_dir, sensor_id, &actuator_log_dir, plugin_loader).await
-                    .with_context(|| format!("Failed to load sensor: {}", sensor_id))?
-            );
-            sensors.insert(sensor_id.clone(), sensor);
+        let mut state_transition = SMatrix::<f64,STATES_NUMBER,STATES_NUMBER>::zeros();
+        let mut observer = DMatrix::from_element(measures_number, measures_number, 0.0);
+        let mut prediction_covariance_noise = DMatrix::from_diagonal_element(measures_number, measures_number, 1.0);
+        let mut error_covariance_noise = DMatrix::from_diagonal_element(measures_number, measures_number, 1.0);
+        
+        let mut measurement = DMatrix::from_element(measures_number, 1, 0.0);
+
+        let mut sensors = Vec::<Sensor>::new();
+        for config_sensor in config.sensors {
+            if let Some(state_index) = CONTROL_VARIABLE_NAMES.get(config_sensor.variable) {
+                sensors.push(Sensor::load(root_dir, config_sensor.config, log_dir).unwrap()?);
+                observer[(sensors.len()-1, state_index)] = 1.0;
+                error_covariance_noise[(sensors.len()-1, sensors.len()-1)] = config_sensor.deviation * config_sensor.deviation;
+            }
         }
 
-        // Load motors
-        let mut motors = HashMap::new();
-        for motor_id in &config.motor_ids {
-            debug!("Loading motor: {}", motor_id);
-            let motor = Arc::new(
-                Motor::load(root_dir, motor_id, &actuator_log_dir, plugin_loader).await
-                    .with_context(|| format!("Failed to load motor: {}", motor_id))?
-            );
-            motors.insert(motor_id.clone(), motor);
-        }
+        let mut motor = Motor::load(root_dir, config.motor.config, log_dir).unwrap()?;
+        let mut control_mode = CONTROL_VARIABLE_NAMES.get(config.motor.variable).unwrap()?;
 
-        // Initialize Kalman filter
-        let kalman_filter = Arc::new(Mutex::new(
-            KalmanFilter::new(
-                config.kalman_filter.state_dimension,
-                config.kalman_filter.measurement_dimension,
-                &config.kalman_filter.process_noise,
-                &config.kalman_filter.measurement_noise,
-            )?
-        ));
+        let mut filter = Kalman1M::new(
+            state_transition, prediction_covariance_noise, observer, error_covariance_noise, measurement
+        );
 
-        // Determine axes and joints count based on control variables
-        let axes_count = config.control_variables.len();
-        let joints_count = 1; // Typically 1 joint per actuator, but could be configurable
-
-        // Initialize actuator state
-        let initial_state = ActuatorState {
-            axes_states: vec![AxisState::default(); axes_count],
-            joint_states: vec![JointState::default(); joints_count],
-            enabled: false,
-            fault: false,
-            fault_message: None,
+        let mut actuator = Actuator {
+            control_state: ControlState::PASSIVE,
+            control_mode: control_mode,
+            sensors: sensors,
+            motor: motor,
+            motion_filter: filter,
+            setpoint_limit: config.motor.limit
         };
 
-        let actuator = Actuator {
-            id: actuator_id.to_string(),
-            config,
-            sensors,
-            motors,
-            kalman_filter,
-            state: Arc::new(RwLock::new(initial_state)),
-            data_logger,
-            axes_count,
-            joints_count,
+        // info!("Actuator loaded successfully");
+
+        return Ok(actuator);
+    }
+
+    fn enable(&self) -> bool {
+        return self.motor.enable();
+    }
+
+    fn disable(&self) {
+        self.motor.disable();
+    }
+
+    fn set_control_state(&mut self, new_state:ControlState) -> bool {
+
+        if(new_state == self.control_state) {
+            return false;
+        }
+        
+        // self.motion_filter.reset();
+        
+        // DEBUG_PRINT( "setting actuator state to %s", ( newState == CONTROL_OFFSET ) ? "offset" : ( ( newState == CONTROL_CALIBRATION ) ? "calibration" : "operation" ) );
+        match new_state {
+            ControlState::OFFSET => {
+                self.sensors.iter_mut().for_each(|sensor| sensor.set_offset());
+                self.motor.set_offset();
+            },
+            ControlState::CALIBRATION => {
+                self.sensors.iter_mut().for_each(|sensor| sensor.set_calibration());
+                self.motor.start_operation();
+            },
+            _ => {
+                self.sensors.iter_mut().for_each(|sensor| sensor.set_measurement());
+                self.motor.start_operation();
+            }
+        }
+        
+        self.control_state = new_state;
+        
+        return true;
+    }
+
+    fn get_measures(&self, &mut measurements:ControlVariables, time_delta:f64 )
+    {       
+        //DEBUG_PRINT( "reading measures from %lu sensors", actuator->sensorsNumber );
+        
+        let &mut state_transition = self.motion_filter.system_mut();
+        state_transition[(ControlIndex::POSITION, ControlIndex::VELOCITY)] = time_delta;
+        state_transition[(ControlIndex::POSITION, ControlIndex::ACCELERATION)] = time_delta * time_delta / 2.0;
+        state_transition[(ControlIndex::VELOCITY, ControlIndex::ACCELERATION)] = time_delta;
+        
+        let mut readings = Vec::<f64>::new();
+        self.sensors.iter_mut().for_each(|sensor| readings.push(sensor.update()));
+        
+        self.motion_filter.predict();
+        self.motion_filter.update(DMatrix::from_vec(self.sensors.len(), 1, readings));
+        
+        let &state = self.motion_filter.state();
+        //DEBUG_PRINT( "p=%.5f, v=%.5f, f=%.5f", filteredMeasures[ POSITION ], filteredMeasures[ VELOCITY ], filteredMeasures[ FORCE ] );
+        measurements.position = state[ControlIndex::POSITION];
+        measurements.velocity = state[ControlIndex::VELOCITY];
+        measurements.acceleration = state[ControlIndex::ACCELERATION];
+        measurements.force = state[ControlIndex::FORCE];
+        
+        // Log_EnterNewLine( actuator->log, Time_GetExecSeconds() );
+        // Log_RegisterList( actuator->log, CONTROL_VARS_NUMBER, (double*) filteredMeasures );
+    }
+
+    fn set_setpoints(&self, &mut setpoints:ControlVariables ) -> f64 {      
+        let motor_setpoint = match self.control_mode {
+            ControlIndex::POSITION => setpoints.position,
+            ControlIndex::VELOCITY => setpoints.velocity,
+            ControlIndex::ACCELERATION => setpoints.acceleration,
+            ControlIndex::FORCE => setpoints.force
         };
 
-        info!("Actuator loaded successfully: {} axes, {} joints", axes_count, joints_count);
-        Ok(actuator)
-    }
-
-    pub async fn activate(&self) -> Result<()> {
-        info!("Activating actuator: {}", self.id);
-
-        // Activate all sensors
-        for (id, sensor) in &self.sensors {
-            debug!("Activating sensor: {}", id);
-            sensor.activate().await
-                .with_context(|| format!("Failed to activate sensor: {}", id))?;
-        }
-
-        // Activate all motors
-        for (id, motor) in &self.motors {
-            debug!("Activating motor: {}", id);
-            motor.activate().await
-                .with_context(|| format!("Failed to activate motor: {}", id))?;
-        }
-
-        // Update state
-        {
-            let mut state = self.state.write().await;
-            state.enabled = true;
-            state.fault = false;
-            state.fault_message = None;
-        }
-
-        info!("Actuator activated successfully");
-        Ok(())
-    }
-
-    pub async fn deactivate(&self) -> Result<()> {
-        info!("Deactivating actuator: {}", self.id);
-
-        // Deactivate all motors first (safety)
-        for (id, motor) in &self.motors {
-            debug!("Deactivating motor: {}", id);
-            if let Err(e) = motor.deactivate().await {
-                warn!("Failed to deactivate motor {}: {}", id, e);
+        if self.setpoint_limit > 0.0 {
+            if motor_setpoint < -self.setpoint_limit { 
+                motor_setpoint = -self.setpoint_limit;
+            } else if motor_setpoint > self.setpoint_limit {
+                motor_setpoint = self.setpoint_limit;
             }
         }
-
-        // Deactivate sensors
-        for (id, sensor) in &self.sensors {
-            debug!("Deactivating sensor: {}", id);
-            if let Err(e) = sensor.deactivate().await {
-                warn!("Failed to deactivate sensor {}: {}", id, e);
-            }
+        //DEBUG_PRINT( "writing mode %d setpoint %g to motor", actuator->controlMode, motorSetpoint );
+        // If the motor is being actually controlled, write its control output
+        if( self.control_state != ControlState::OFFSET ) {
+            self.motor.set_target( motor_setpoint );
         }
-
-        // Update state
-        {
-            let mut state = self.state.write().await;
-            state.enabled = false;
-        }
-
-        info!("Actuator deactivated");
-        Ok(())
-    }
-
-    pub async fn emergency_stop(&self) -> Result<()> {
-        warn!("Emergency stop for actuator: {}", self.id);
-
-        // Emergency stop all motors immediately
-        for (id, motor) in &self.motors {
-            if let Err(e) = motor.emergency_stop().await {
-                warn!("Failed to emergency stop motor {}: {}", id, e);
-            }
-        }
-
-        // Update state
-        {
-            let mut state = self.state.write().await;
-            state.enabled = false;
-            state.fault = true;
-            state.fault_message = Some("Emergency stop activated".to_string());
-        }
-
-        Ok(())
-    }
-
-    pub async fn reset_emergency_stop(&self) -> Result<()> {
-        info!("Resetting emergency stop for actuator: {}", self.id);
-
-        // Reset emergency stop on all motors
-        for (id, motor) in &self.motors {
-            motor.reset_emergency_stop().await
-                .with_context(|| format!("Failed to reset emergency stop on motor: {}", id))?;
-        }
-
-        // Update state
-        {
-            let mut state = self.state.write().await;
-            state.fault = false;
-            state.fault_message = None;
-        }
-
-        Ok(())
-    }
-
-    pub async fn read_state(&self) -> Result<ActuatorState> {
-        // Read all sensor values
-        let mut sensor_measurements = Vec::new();
-        for sensor in self.sensors.values() {
-            let measurement = sensor.read().await?;
-            sensor_measurements.push(measurement.value);
-        }
-
-        // Apply Kalman filtering if enabled
-        let filtered_measurements = if self.config.kalman_filter.enabled && !sensor_measurements.is_empty() {
-            let mut kf = self.kalman_filter.lock().await;
-            kf.predict()?;
-            kf.update(&sensor_measurements)?;
-            kf.get_state().to_vec()
-        } else {
-            sensor_measurements
-        };
-
-        // Convert measurements to control variables
-        let mut axes_states = Vec::with_capacity(self.axes_count);
-        for (i, &measurement) in filtered_measurements.iter().enumerate() {
-            if i < self.axes_count {
-                let variable_name = &self.config.control_variables[i];
-                let mut control_vars = ControlVariables::default();
-                
-                match variable_name.as_str() {
-                    "position" => control_vars.position = measurement,
-                    "velocity" => control_vars.velocity = measurement,
-                    "force" => control_vars.force = measurement,
-                    "acceleration" => control_vars.acceleration = measurement,
-                    _ => control_vars.position = measurement, // Default to position
-                }
-
-                axes_states.push(AxisState {
-                    measurements: control_vars,
-                    setpoints: ControlVariables::default(), // Will be set by controller
-                    errors: ControlVariables::default(),    // Will be computed
-                    enabled: true,
-                    fault: false,
-                    fault_message: None,
-                    timestamp: std::time::SystemTime::now(),
-                });
-            }
-        }
-
-        // Compute joint states (simplified: average of axes)
-        let mut joint_states = Vec::with_capacity(self.joints_count);
-        if !axes_states.is_empty() {
-            let avg_position = axes_states.iter().map(|a| a.measurements.position).sum::<f64>() / axes_states.len() as f64;
-            let avg_velocity = axes_states.iter().map(|a| a.measurements.velocity).sum::<f64>() / axes_states.len() as f64;
-            let avg_force = axes_states.iter().map(|a| a.measurements.force).sum::<f64>() / axes_states.len() as f64;
-
-            joint_states.push(JointState {
-                measurements: ControlVariables {
-                    position: avg_position,
-                    velocity: avg_velocity,
-                    force: avg_force,
-                    ..ControlVariables::default()
-                },
-                setpoints: ControlVariables::default(),
-                errors: ControlVariables::default(),
-                enabled: true,
-                fault: false,
-                fault_message: None,
-                timestamp: std::time::SystemTime::now(),
-            });
-        }
-
-        let current_state = self.state.read().await;
-        let state = ActuatorState {
-            axes_states,
-            joint_states,
-            enabled: current_state.enabled,
-            fault: current_state.fault,
-            fault_message: current_state.fault_message.clone(),
-        };
-
-        // Log the state
-        if self.config.logging.enabled {
-            self.data_logger.log_actuator_state(&self.id, &state).await?;
-        }
-
-        Ok(state)
-    }
-
-    pub async fn write_control_outputs(&self, outputs: &[ControlOutput]) -> Result<()> {
-        if outputs.len() != self.motors.len() {
-            anyhow::bail!("Output count ({}) doesn't match motor count ({})", 
-                         outputs.len(), self.motors.len());
-        }
-
-        // Send commands to motors
-        for (i, (motor_id, motor)) in self.motors.iter().enumerate() {
-            if let Some(output) = outputs.get(i) {
-                // Determine output value based on control mode
-                let command_value = output.position
-                    .or(output.velocity)
-                    .or(output.force)
-                    .unwrap_or(0.0);
-
-                motor.write(command_value).await
-                    .with_context(|| format!("Failed to write to motor: {}", motor_id))?;
-            }
-        }
-
-        Ok(())
-    }
-
-    pub fn axes_count(&self) -> usize {
-        self.axes_count
-    }
-
-    pub fn joints_count(&self) -> usize {
-        self.joints_count
-    }
-
-    pub async fn run_diagnostics(&self) -> Result<HashMap<String, String>> {
-        let mut diagnostics = HashMap::new();
-
-        // Check sensor health
-        for (id, sensor) in &self.sensors {
-            match sensor.self_test().await {
-                Ok(result) => {
-                    diagnostics.insert(format!("sensor_{}", id), result);
-                }
-                Err(e) => {
-                    diagnostics.insert(format!("sensor_{}", id), format!("Error: {}", e));
-                }
-            }
-        }
-
-        // Check motor health
-        for (id, motor) in &self.motors {
-            match motor.self_test().await {
-                Ok(result) => {
-                    diagnostics.insert(format!("motor_{}", id), result);
-                }
-                Err(e) => {
-                    diagnostics.insert(format!("motor_{}", id), format!("Error: {}", e));
-                }
-            }
-        }
-
-        // Check Kalman filter status
-        if self.config.kalman_filter.enabled {
-            let kf = self.kalman_filter.lock().await;
-            diagnostics.insert("kalman_filter".to_string(), 
-                             format!("State dim: {}, Meas dim: {}", 
-                                   kf.state_dimension(), kf.measurement_dimension()));
-        }
-
-        Ok(diagnostics)
-    }
-
-    pub async fn shutdown(&self) -> Result<()> {
-        info!("Shutting down actuator: {}", self.id);
-
-        // Shutdown motors first
-        for (id, motor) in &self.motors {
-            debug!("Shutting down motor: {}", id);
-            if let Err(e) = motor.shutdown().await {
-                warn!("Failed to shutdown motor {}: {}", id, e);
-            }
-        }
-
-        // Shutdown sensors
-        for (id, sensor) in &self.sensors {
-            debug!("Shutting down sensor: {}", id);
-            if let Err(e) = sensor.shutdown().await {
-                warn!("Failed to shutdown sensor {}: {}", id, e);
-            }
-        }
-
-        // Shutdown data logging
-        self.data_logger.shutdown().await?;
-
-        info!("Actuator shutdown complete");
-        Ok(())
+        //DEBUG_PRINT( "setpoint %g written to motor", motorSetpoint );
+        return motor_setpoint;
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use tempfile::TempDir;
+// #[cfg(test)]
+// mod tests {
+//     use super::*;
+//     use tempfile::TempDir;
 
-    #[tokio::test]
-    async fn test_actuator_state_transitions() {
-        // Test basic actuator state transitions without actual hardware
-        let temp_dir = TempDir::new().unwrap();
-        
-        // This would require mock configurations and plugins
-        // Implementation depends on actual plugin architecture
-    }
+//     #[tokio::test]
+//     async fn test_actuator_state_transitions() {
+//         // Test basic actuator state transitions without actual hardware
+//         let temp_dir = TempDir::new().unwrap();
 
-    #[test]
-    fn test_control_variables_mapping() {
-        let variables = vec!["position".to_string(), "velocity".to_string()];
-        assert_eq!(variables.len(), 2);
-        
-        // Test that we can map measurement values to appropriate control variables
-        let measurement = 1.5;
-        match variables[0].as_str() {
-            "position" => assert_eq!(measurement, 1.5),
-            _ => panic!("Unexpected variable type"),
-        }
-    }
-}
+//         // This would require mock configurations and plugins
+//         // Implementation depends on actual plugin architecture
+//     }
+
+//     #[test]
+//     fn test_control_variables_mapping() {
+//         let variables = vec!["position".to_string(), "velocity".to_string()];
+//         assert_eq!(variables.len(), 2);
+
+//         // Test that we can map measurement values to appropriate control variables
+//         let measurement = 1.5;
+//         match variables[0].as_str() {
+//             "position" => assert_eq!(measurement, 1.5),
+//             _ => panic!("Unexpected variable type"),
+//         }
+//     }
+// }
